@@ -1,19 +1,79 @@
-# Sensor Data Noise Filter (Moving Average)
+# Sensor Data Noise Filter (Adaptive Moving Average)
 
-Bu proje, robotik ve gömülü sistemlerde mesafe sensörlerinden (Ultrasonik, LiDAR vb.) gelen gürültülü verileri yumuşatmak için yazılmış bir C++ uygulamasıdır, hareketli ortalama kullanarak ham verideki düzensizliği dengelemeyi amaçlıyorum. Spike durumunda bir sonraki veriler ile doğrulama yapmasını sağlayarak yanıltıcı sensör verisinin önüne geçilerek en doğru sonuç kullanılacak.
+![C++](https://img.shields.io/badge/Language-C%2B%2B11%2B-00599C?style=flat-square&logo=c%2B%2B)
+![Domain](https://img.shields.io/badge/Domain-Embedded%20%26%20Robotics-success?style=flat-square)
+![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)
+
+Bu proje, robotik ve gömülü sistemlerde mesafe sensörlerinden (Ultrasonik, LiDAR, ToF vb.) gelen gürültülü verileri yumuşatmak ve anlık hatalı sıçramaları (spike) ayıklamak için geliştirilmiş bir **C++ sinyal filtreleme** uygulamasıdır. 
+
+Klasik Hareketli Ortalama (Moving Average) filtrelerinden farklı olarak **İleri Bakışlı Doğrulama (Look-Ahead Spike Validation)** mekanizmasına sahiptir: Ani bir veri değişimi algılandığında hemen karar vermek yerine sonraki okumalarla bu değişimi doğrular. Böylece tek seferlik sensör gürültülerini tamamen yok ederken, sensörün önündeki gerçek fiziksel mesafe değişimlerine (Step Change) faz gecikmesi olmadan anında adapte olur.
+
+---
 
 ## Neden Gerekli?
-Motor sürücüleri ve PID kontrolcüleri, anlık sensör sıçramalarına (spike) sert tepkiler verir. Bu durum motorlarda titremeye (jitter) ve aşırı akım çekimine yol açar. Bu algoritma, donanımsal gürültüleri filtreleyerek sisteme kararlı bir veri akışı sağlar.
+Motor sürücüleri ve PID kontrolcüleri, anlık sensör sıçramalarına (spike) sert tepkiler verir. Bu durum motorlarda titremeye (jitter), mekanik aşınmaya ve aşırı akım çekimine yol açar. Öte yandan, standart bir Moving Average filtresi gerçek bir engel belirdiğinde eski verilerin ortalamasını almaya devam ettiği için tepki gecikmesi (lag) yaratır. 
+
+Bu algoritma iki sorunu aynı anda çözer:
+1. **Tekil Gürültü Bastırma:** Anlık hatalı okumaları pencereye dahil etmeden siler.
+2. **Dinamik Pencere Sıfırlama:** Kalıcı bir seviye değişimi doğrulandığında eski ortalamayı unutarak yeni seviyeden sıfırdan başlar.
+
+---
+
+## Algoritma Mantığı (Karar Mekanizması)
+
+Filtre, mevcut sensör okuması ile son geçerli ortalama arasındaki fark belirlenen eşik değerini (`threshold = 20.0`) aştığında **Şüpheli Durum** moduna geçer ve bir sonraki veriyi inceler:
+
+| Senaryo | Örnek Veri Akışı | Algoritmanın Kararı ve Aksiyonu |
+| :--- | :--- | :--- |
+| **Normal Seyir** | `500` $\rightarrow$ `503` $\rightarrow$ `502` | Eşik değerin altında. Standart kayan pencere (Moving Average) uygulanır. |
+| **Tekil Gürültü (Spike)** | `501` $\rightarrow$ **`453`** $\rightarrow$ `497` | `453` değeri bir sonraki `497` verisiyle yalanlandı. **`453` silinir**, eski ortalama bozulmadan devam eder. |
+| **Gerçek Seviye Değişimi** | `500` $\rightarrow$ **`561`** $\rightarrow$ **`560`** | `561` sıçraması bir sonraki `560` verisiyle doğrulandı. **Eski ortalama tamamen unutulur**, `561` noktasından yeni bir Moving Average başlatılır. |
+| **Kararsız Geçiş** | `500` $\rightarrow$ **`600`** $\rightarrow$ **`550`** | Ara değerler netleşene kadar bekleyen döngü devam eder; sinyal kararlı bir seviyeye oturduğunda geçmiş adımlar güncellenir. |
+
+---
 
 ## Kullanılan C++ Konseptleri
-* **Dinamik Bellek Yönetimi:** Çalışma zamanında `new` ve `delete` kullanılarak veri setine uygun bellek tahsisi.
-* **Pointer Aritmetiği:** Dizilerin kopyalanması yerine bellek adresleri üzerinden yüksek performanslı veri manipülasyonu.
-* **Struct Yapıları:** Zaman damgası (timestamp), ham veri ve filtrelenmiş verinin tek bir veri bloğunda paketlenmesi.
+- **Dinamik Bellek Yönetimi:** Çalışma zamanında `new` ve `delete[]` kullanılarak veri setine uygun bellek tahsisi ve güvenli bellek temizliği.
+- **Pointer Aritmetiği:** Dizilerin kopyalanması yerine bellek adresleri üzerinden yüksek performanslı veri manipülasyonu.
+- **Struct Yapıları:** Zaman damgası (`timestamp`), ham veri (`FirstValue`) ve filtrelenmiş verinin (`FilteredValue`) tek bir veri bloğunda paketlenmesi.
+- **Modern Rastgele Sayı Üretimi (`<random>`):** Mersenne Twister (`mt19937`) motoru, Gauss dip gürültüsü (`normal_distribution`) ve Bernoulli dağılımı ile gerçekçi sensör simülasyonu.
 
+---
 
-## Örnek Veri (1 saniyelik)
+## Örnek Çıktı Analizi (Kritik Kırılma Anları)
+
+Aşağıdaki kesitte algoritmanın **50. ms** ve **370. ms**'deki sahte sıçramaları nasıl yuttuğu, **400. ms** ve **750. ms**'deki gerçek mesafe değişimlerine ise gecikmesiz nasıl adapte olduğu görülmektedir:
+
+```text
 Zaman(ms)       Ham             Filtreli        Durum
-__________________________________________________________
+-------------------------------------------------------------------------
+0               499.85          499.85
+...
+40              499.98          501.85
+50              453.71          501.85          <-- SPIKE SILINDI (Eski MA devam ediyor)
+60              497.96          501.11
+...
+360             501.52          500.28
+370             451.54          500.28          <-- SPIKE SILINDI (Eski MA devam ediyor)
+380             499.38          500.07
+390             498.37          500.80
+400             561.87          561.87          <-- YENI SEVIYE ONAYLANDI (Eski MA unutuldu!)
+410             560.92          561.39
+420             560.14          560.98
+430             485.82          560.98          <-- SPIKE SILINDI (Eski MA devam ediyor)
+440             560.08          560.80
+...
+740             565.09          561.35
+750             501.35          501.35          <-- YENI SEVIYE ONAYLANDI (Eski MA unutuldu!)
+760             499.22          500.29
+```
+
+<details>
+<summary><b>📄 1 Saniyelik Tüm Simülasyon Verisini Görüntüle (0 - 1000 ms)</b></summary>
+
+```text
+Zaman(ms)       Ham             Filtreli        Durum
+-------------------------------------------------------------------------
 0               499.85          499.85
 10              503.66          501.75
 20              503.27          502.26
@@ -46,7 +106,7 @@ __________________________________________________________
 290             501.97          500.08
 300             501.40          500.49
 310             500.02          500.63
-320             499.99          500.74
+320             500.74          500.74
 330             500.74          500.82
 340             494.71          499.37
 350             504.47          499.99
@@ -115,9 +175,18 @@ __________________________________________________________
 980             499.57          496.98
 990             498.10          498.05
 1000            499.08          497.68
+```
+</details>
+
+---
 
 ## Nasıl Çalıştırılır?
-Kodu derlemek ve çalıştırmak için:
+
+Projeyi klonlayın ve `g++` derleyicisi ile derleyip çalıştırın:
+
 ```bash
-g++ main.cpp -o filter
+git clone [https://github.com/ardasengur/sensor-noise-filter-cpp.git](https://github.com/ardasengur/sensor-noise-filter-cpp.git)
+cd sensor-noise-filter-cpp
+g++ -std=c++11 main.cpp -o filter
 ./filter
+```
