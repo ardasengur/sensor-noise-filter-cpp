@@ -6,183 +6,184 @@
 
 using namespace std;
 
-struct SensorData {
-    int timestamp;
-    float FirstValue;
-    float FilteredValue;
+enum FilterStatus {
+    STATUS_NORMAL,
+    STATUS_HOLDING_SUSPECT,
+    STATUS_SPIKE_REJECTED,  
+    STATUS_NEW_LEVEL        
 };
 
-// İki değer birbirine eşik değerinden (threshold) daha mı yakın?
-bool isClose(float a, float b, float threshold) {
-    return abs(a - b) <= threshold;
-}
+class AdaptiveMovingAverage {
+private:
+    enum State {
+        STATE_NORMAL,
+        STATE_SUSPECT
+    };
 
-void movingAverage(SensorData* data, int size, int windowSize) {
-    if (size <= 0) return;
+    int windowSize;
+    float threshold;
 
-    float threshold = 20.0f; // 20 birimden fazla ani değişimler "şüpheli" (spike adayı)
-    
-    // Eski moving average'ı unutmak istediğimizde bu başlangıç sınırını ileri taşıyacağız
-    int windowStartIndex = 0;
+    float* ringBuffer;
+    int head;         
+    int count;        
+    float runningSum;  
 
-    // İlk veriyi başlangıç referansı olarak al
-    data[0].FilteredValue = data[0].FirstValue;
-    float lastValidAverage = data[0].FilteredValue;
+    State currentState;
+    bool isInitialized;
+    float lastValidAverage;
+    float lastSuspectValue;
+    FilterStatus lastActionStatus;
 
-    int i = 1;
-    while (i < size) {
-        float currentVal = data[i].FirstValue;
+    bool isClose(float a, float b) const {
+        return abs(a - b) <= threshold;
+    }
 
-        // 1. DURUM: Veri eski ortalamaya yakınsa normal Moving Average devam eder
-        if (isClose(currentVal, lastValidAverage, threshold)) {
-            float sum = 0.0f;
-            int count = 0;
+    void pushToBuffer(float val) {
+        if (count == windowSize) {
+            runningSum -= ringBuffer[head];
+        } else {
+            count++;
+        }
+        ringBuffer[head] = val;
+        runningSum += val;
+        head = (head + 1) % windowSize;
+        
+        lastValidAverage = runningSum / count;
+    }
 
-            for (int j = 0; j < windowSize; ++j) {
-                // windowStartIndex sayesinde unutulan eski geçmişe ASLA bakılmaz
-                if (i - j >= windowStartIndex) {
-                    sum += data[i - j].FirstValue;
-                    count++;
-                }
+    void resetBuffer() {
+        head = 0;
+        count = 0;
+        runningSum = 0.0f;
+    }
+
+public:
+    AdaptiveMovingAverage(int winSize, float thresh) 
+        : windowSize(winSize), threshold(thresh), head(0), count(0), 
+          runningSum(0.0f), currentState(STATE_NORMAL), isInitialized(false),
+          lastValidAverage(0.0f), lastSuspectValue(0.0f), lastActionStatus(STATUS_NORMAL) 
+    {
+        ringBuffer = new float[windowSize];
+        for (int i = 0; i < windowSize; ++i) ringBuffer[i] = 0.0f;
+    }
+
+    ~AdaptiveMovingAverage() {
+        delete[] ringBuffer;
+    }
+
+    float update(float newReading) {
+        if (!isInitialized) {
+            pushToBuffer(newReading);
+            isInitialized = true;
+            lastActionStatus = STATUS_NORMAL;
+            return lastValidAverage;
+        }
+
+        if (currentState == STATE_NORMAL) {
+            if (isClose(newReading, lastValidAverage)) {
+                pushToBuffer(newReading);
+                lastActionStatus = STATUS_NORMAL;
+                return lastValidAverage;
+            } else {
+                currentState = STATE_SUSPECT;
+                lastSuspectValue = newReading;
+                lastActionStatus = STATUS_HOLDING_SUSPECT;
+                return lastValidAverage;
             }
-
-            data[i].FilteredValue = count > 0 ? sum / count : 0.0f;
-            lastValidAverage = data[i].FilteredValue;
-            i++;
-        } 
-        // 2. DURUM: Spike yakalandı! Hemen aksiyon alma, bir sonraki verilerle doğrula
+        }
         else {
-            int k = i + 1;
-            bool isConfirmedNewLevel = false;
-            bool decisionMade = false;
-
-            // Kararsız durumlar (Örn: 500 -> 600 -> 550) bitene kadar ileriye bakan döngü
-            while (k < size) {
-                float nextVal = data[k].FirstValue;
-                float prevSuspect = data[k - 1].FirstValue;
-
-                // A) Sonraki veri ESKİ ortalamaya yakın (Örn: 500 -> 580 -> 502)
-                // Demek ki bu gerçek bir spike (hatalı okuma)!
-                if (isClose(nextVal, lastValidAverage, threshold)) {
-                    isConfirmedNewLevel = false;
-                    decisionMade = true;
-                    break;
-                }
-                // B) Sonraki veri bir önceki şüpheli (spike) değerine yakın (Örn: 500 -> 580 -> 585)
-                // Demek ki bu gerçek bir seviye değişimi!
-                else if (isClose(nextVal, prevSuspect, threshold)) {
-                    isConfirmedNewLevel = true;
-                    decisionMade = true;
-                    break;
-                }
-
-                // C) İkisine de yakın değilse (Örn: 500 -> 600 -> 550), bir sonrakini beklemeye devam et
-                k++;
+            if (isClose(newReading, lastValidAverage)) {
+                pushToBuffer(newReading);
+                currentState = STATE_NORMAL;
+                lastActionStatus = STATUS_SPIKE_REJECTED;
+                return lastValidAverage;
             }
-
-            if (decisionMade && isConfirmedNewLevel) {
-                // YENİ SEVİYE DOĞRULANDI! (Örn: 580 -> 585)
-                int confirmedStartIdx = k - 1;
-
-                // Eğer arada kararsız veriler (Örn: 500 -> 600 -> 550 -> 552'deki 600) varsa onları temizle
-                for (int m = i; m < confirmedStartIdx; ++m) {
-                    data[m].FirstValue = lastValidAverage;
-                    data[m].FilteredValue = lastValidAverage;
-                }
-
-                // ESKİ MOVING AVERAGE'I UNUT ve confirmedStartIdx'ten baştan başla!
-                windowStartIndex = confirmedStartIdx;
-                data[confirmedStartIdx].FilteredValue = data[confirmedStartIdx].FirstValue;
-                lastValidAverage = data[confirmedStartIdx].FilteredValue;
-
-                // Döngüyü doğrulanan verinin hemen sonrasından (k'dan) devam ettir
-                i = k;
-            } 
+            else if (isClose(newReading, lastSuspectValue)) {
+                resetBuffer();
+                pushToBuffer(lastSuspectValue);
+                pushToBuffer(newReading);     
+                
+                currentState = STATE_NORMAL;
+                lastActionStatus = STATUS_NEW_LEVEL;
+                return lastValidAverage;
+            }
             else {
-                // YANLIŞ ALARM (SPIKE)! (Örn: 500 -> 580 -> 502)
-                // Spike verisini sil (eski ortalama ile ez) ve eski Moving Average'a devam et
-                for (int m = i; m < k; ++m) {
-                    data[m].FirstValue = lastValidAverage;
-                    data[m].FilteredValue = lastValidAverage;
-                }
-                i = k;
+                lastSuspectValue = newReading;
+                lastActionStatus = STATUS_HOLDING_SUSPECT;
+                return lastValidAverage;
             }
         }
     }
-}
 
-void generateRealisticSensorData(SensorData* data, int size, float baseValue) {
-    random_device rd;
-    mt19937 gen(rd());
+    FilterStatus getStatus() const {
+        return lastActionStatus;
+    }
+};
+
+float getSimulatedSensorReading(int step, float& currentBase, mt19937& gen) {
     normal_distribution<float> backgroundNoise(0.0f, 2.5f);
     uniform_real_distribution<float> chance(0.0f, 1.0f);
     uniform_real_distribution<float> spikeMagnitude(35.0f, 80.0f);
     bernoulli_distribution isPositive(0.5);
 
-    float currentBase = baseValue;
-
-    for (int i = 0; i < size; i++) {
-        data[i].timestamp = i * 10;
-
-        // Algoritmanın "yeni seviyeyi doğrulama" özelliğini de test edebilmek için
-        // 40. ve 75. adımlarda sensörün gerçek değerini kalıcı olarak değiştiriyoruz (Örn: 500 -> 580)
-        if (i == 40 || i == 75) {
-            float stepDirection = isPositive(gen) ? 1.0f : -1.0f;
-            currentBase += stepDirection * 60.0f;
-        }
-
-        float currentReading = currentBase + backgroundNoise(gen);
-
-        // %8 ihtimalle anlık tekil spike (gürültü) üret
-        if (chance(gen) < 0.08f) {
-            float direction = isPositive(gen) ? 1.0f : -1.0f;
-            currentReading += direction * spikeMagnitude(gen);
-        }
-
-        data[i].FirstValue = currentReading;
-        data[i].FilteredValue = 0.0f;
+    if (step == 40 || step == 75) {
+        float stepDirection = isPositive(gen) ? 1.0f : -1.0f;
+        currentBase += stepDirection * 60.0f;
     }
+
+    float reading = currentBase + backgroundNoise(gen);
+
+    if (chance(gen) < 0.08f) {
+        float direction = isPositive(gen) ? 1.0f : -1.0f;
+        reading += direction * spikeMagnitude(gen);
+    }
+
+    return reading;
 }
 
 int main() {
-    int Samplecount = 101;
-    int windowsize = 5;
-    float baseSensorValue = 500.0f;
+    int totalSteps = 101;
+    int windowSize = 5;
+    float threshold = 20.0f;
+    float currentBase = 500.0f;
 
-    SensorData* readings = new SensorData[Samplecount];
-    float* originalRawValues = new float[Samplecount]; // Silinmeden önceki ham hallerini ekranda görmek için
+    random_device rd;
+    mt19937 gen(rd());
 
-    generateRealisticSensorData(readings, Samplecount, baseSensorValue);
-
-    for (int i = 0; i < Samplecount; i++) {
-        originalRawValues[i] = readings[i].FirstValue;
-    }
-
-    movingAverage(readings, Samplecount, windowsize);
+    AdaptiveMovingAverage filter(windowSize, threshold);
 
     cout << fixed << setprecision(2);
-    cout << "Zaman(ms)\tHam\t\tFiltreli\tDurum" << endl;
-    cout << "-------------------------------------------------------------------------" << endl;
-    
-    for (int i = 0; i < Samplecount; i++) {
-        string status = "";
-        
-        // Ekranda ne olduğunu net görmek için durum analizi:
-        if (abs(originalRawValues[i] - readings[i].FirstValue) > 0.01f) {
-            status = "<-- SPIKE SILINDI";
-        } else if (i > 0 && abs(readings[i].FilteredValue - readings[i - 1].FilteredValue) > 20.0f) {
-            status = "<-- YENI SEVIYE ONAYLANDI";
-        }
-        
-        cout << readings[i].timestamp << "\t\t" 
-             << originalRawValues[i] << "\t\t" 
-             << readings[i].FilteredValue << "\t\t"
-             << status << endl;
-    }
+    cout << "Zaman(ms)\tHam\t\tFiltreli\tDurum (Real-Time Karar)" << endl;
+    cout << "----------------------------------------------------------------------------------" << endl;
 
-    delete[] readings;
-    delete[] originalRawValues;
-    readings = nullptr;
+    for (int i = 0; i < totalSteps; i++) {
+        int timestamp = i * 10;
+        
+        float rawReading = getSimulatedSensorReading(i, currentBase, gen);
+
+        float filteredOutput = filter.update(rawReading);
+
+        string statusText = "";
+        switch (filter.getStatus()) {
+            case STATUS_HOLDING_SUSPECT:
+                statusText = "<-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...";
+                break;
+            case STATUS_SPIKE_REJECTED:
+                statusText = "<-- [SPIKE SILINDI] Onceki supheli veri reddedildi!";
+                break;
+            case STATUS_NEW_LEVEL:
+                statusText = "<-- [YENI SEVIYE] Dogrulandi! Eski MA unutuldu!";
+                break;
+            default:
+                statusText = "";
+                break;
+        }
+
+        cout << timestamp << "\t\t" 
+             << rawReading << "\t\t" 
+             << filteredOutput << "\t\t" 
+             << statusText << endl;
+    }
 
     return 0;
 }
