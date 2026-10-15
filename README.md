@@ -1,188 +1,248 @@
-# Sensor Data Noise Filter (Adaptive Moving Average)
+# Sensor Data Noise Filter (Real-Time Adaptive Moving Average)
 
 ![C++](https://img.shields.io/badge/Language-C%2B%2B11%2B-00599C?style=flat-square&logo=c%2B%2B)
+![Architecture](https://img.shields.io/badge/Architecture-O(1)%20Ring%20Buffer%20%26%20FSM-orange?style=flat-square)
 ![Domain](https://img.shields.io/badge/Domain-Embedded%20%26%20Robotics-success?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)
 
-Bu proje, robotik ve gömülü sistemlerde mesafe sensörlerinden (Ultrasonik, LiDAR, ToF vb.) gelen gürültülü verileri yumuşatmak ve anlık hatalı sıçramaları (spike) ayıklamak için geliştirilmiş bir **C++ sinyal filtreleme** uygulamasıdır. 
+Bu proje, robotik ve gömülü sistemlerde mesafe sensörlerinden (Ultrasonik, LiDAR, ToF vb.) gelen gürültülü verileri **gerçek zamanlı (real-time streaming)** olarak yumuşatmak ve anlık hatalı sıçramaları (spike) ayıklamak için geliştirilmiş, nesne yönelimli (OOP) bir **C++ sinyal filtreleme** kütüphanesidir.
 
-Klasik Hareketli Ortalama (Moving Average) filtrelerinden farklı olarak **İleri Bakışlı Doğrulama (Look-Ahead Spike Validation)** mekanizmasına sahiptir: Ani bir veri değişimi algılandığında hemen karar vermek yerine sonraki okumalarla bu değişimi doğrular. Böylece tek seferlik sensör gürültülerini tamamen yok ederken, sensörün önündeki gerçek fiziksel mesafe değişimlerine (Step Change) faz gecikmesi olmadan anında adapte olur.
+Klasik Hareketli Ortalama (Moving Average) filtrelerinden farklı olarak **Durum Makinesi Tabanlı Sıçrama Doğrulama (State-Machine Spike Validation)** ve **$O(1)$ Dairesel Tampon (Ring Buffer)** mimarisine sahiptir. Gelecekteki veri dizisine ihtiyaç duymadan verileri tek tek (`update(rawReading)`) işler: Ani bir sıçrama algılandığında veriyi şüpheli olarak beklemeye alır ve bir sonraki okumayla doğrular. Böylece tek seferlik sensör gürültülerini tamamen yok ederken, gerçek fiziksel mesafe değişimlerine (Step Change) anında adapte olur.
 
 ---
 
 ## Neden Gerekli?
-Motor sürücüleri ve PID kontrolcüleri, anlık sensör sıçramalarına (spike) sert tepkiler verir. Bu durum motorlarda titremeye (jitter), mekanik aşınmaya ve aşırı akım çekimine yol açar. Öte yandan, standart bir Moving Average filtresi gerçek bir engel belirdiğinde eski verilerin ortalamasını almaya devam ettiği için tepki gecikmesi (lag) yaratır. 
+Motor sürücüleri ve PID kontrolcüleri, anlık sensör sıçramalarına (spike) sert tepkiler verir. Bu durum motorlarda titremeye (jitter), mekanik aşınmaya ve aşırı akım çekimine yol açar. Öte yandan, standart bir Moving Average filtresi gerçek bir engel belirdiğinde eski verilerin ortalamasını almaya devam ettiği için tepki gecikmesi (lag) yaratır.
 
-Bu algoritma iki sorunu aynı anda çözer:
-1. **Tekil Gürültü Bastırma:** Anlık hatalı okumaları pencereye dahil etmeden siler.
-2. **Dinamik Pencere Sıfırlama:** Kalıcı bir seviye değişimi doğrulandığında eski ortalamayı unutarak yeni seviyeden sıfırdan başlar.
+Bu algoritma gömülü sistemlerdeki üç temel sorunu aynı anda çözer:
+1. **Gerçek Zamanlı Sıçrama Koruması (State Machine):** Şüpheli okuma geldiğinde motora/kontrolcüye son güvenli ortalamayı vermeye devam eder, bir sonraki adımda sıçrama yalanlanırsa gürültüyü pencereye hiç sokmadan siler.
+2. **Dinamik Pencere Sıfırlama:** Kalıcı bir seviye değişimi doğrulandığında eski ortalamayı tamamen unutarak (`resetBuffer()`) yeni seviyeden sıfırdan başlar.
+3. **$O(1)$ Zaman ve Bellek Karmaşıklığı (Ring Buffer):** Geçmişteki tüm verileri bellekte tutmak yerine yalnızca pencere boyutu kadar (`windowSize`) dairesel bir dizi ve kayan toplam (`runningSum`) tutar. Mikrodenetleyicilerde (Arduino, STM32, ESP32) RAM şişmesine veya döngü gecikmesine yol açmaz.
 
 ---
 
-## Algoritma Mantığı (Karar Mekanizması)
+## Algoritma Mantığı (Durum Makinesi Karar Mekanizması)
 
-Filtre, mevcut sensör okuması ile son geçerli ortalama arasındaki fark belirlenen eşik değerini (`threshold = 20.0`) aştığında **Şüpheli Durum** moduna geçer ve bir sonraki veriyi inceler:
+Filtre, `STATE_NORMAL` ve `STATE_SUSPECT` olmak üzere iki durumlu bir sonlu durum makinesi (FSM) olarak çalışır. Mevcut okuma ile son geçerli ortalama arasındaki fark eşik değerini (`threshold = 20.0`) aştığında `STATE_SUSPECT` moduna geçilir:
 
-| Senaryo | Örnek Veri Akışı | Algoritmanın Kararı ve Aksiyonu |
+| Durum / Senaryo | Gerçek Zamanlı Veri Akışı | Filtrenin Kararı ve Aksiyonu (`update()`) |
 | :--- | :--- | :--- |
-| **Normal Seyir** | `500` $\rightarrow$ `503` $\rightarrow$ `502` | Eşik değerin altında. Standart kayan pencere (Moving Average) uygulanır. |
-| **Tekil Gürültü (Spike)** | `501` $\rightarrow$ **`453`** $\rightarrow$ `497` | `453` değeri bir sonraki `497` verisiyle yalanlandı. **`453` silinir**, eski ortalama bozulmadan devam eder. |
-| **Gerçek Seviye Değişimi** | `500` $\rightarrow$ **`561`** $\rightarrow$ **`560`** | `561` sıçraması bir sonraki `560` verisiyle doğrulandı. **Eski ortalama tamamen unutulur**, `561` noktasından yeni bir Moving Average başlatılır. |
-| **Kararsız Geçiş** | `500` $\rightarrow$ **`600`** $\rightarrow$ **`550`** | Ara değerler netleşene kadar bekleyen döngü devam eder; sinyal kararlı bir seviyeye oturduğunda geçmiş adımlar güncellenir. |
+| **Normal Seyir** | `498.49` $\rightarrow$ `498.65` | Fark eşik değerin altında. Veri doğrudan **Ring Buffer**'a eklenir ve kayan toplam ($O(1)$) ile yeni ortalama döndürülür. |
+| **Şüpheli Veri Yakalama** | `498.65` $\rightarrow$ **`551.32`** | Ani sıçrama! `551.32` gözaltına alınır (`STATE_SUSPECT`). Doğrulama gelene kadar sisteme son güvenli ortalama (**`498.57`**) döndürülür. |
+| **Arka Arkaya Kararsız Spike** | `551.32` $\rightarrow$ **`444.51`** $\rightarrow$ `501.99` | İki ardışık zıt spike (`551` ve `444`) boyunca güvenli ortalama (`498.57`) korunur; `501.99` geldiğinde her iki spike da reddedilir ve normal akışa dönülür. |
+| **Gerçek Seviye Değişimi** | `504.53` $\rightarrow$ **`556.68`** $\rightarrow$ **`562.62`** | `556.68` beklendikten hemen sonra gelen `562.62` yeni seviyeyi doğrular. **Ring Buffer sıfırlanır (eski MA unutulur)** ve iki yeni verinin ortalaması (**`559.65`**) ile yeni seviyeden devam edilir. |
 
 ---
 
-## Kullanılan C++ Konseptleri
-- **Dinamik Bellek Yönetimi:** Çalışma zamanında `new` ve `delete[]` kullanılarak veri setine uygun bellek tahsisi ve güvenli bellek temizliği.
-- **Pointer Aritmetiği:** Dizilerin kopyalanması yerine bellek adresleri üzerinden yüksek performanslı veri manipülasyonu.
-- **Struct Yapıları:** Zaman damgası (`timestamp`), ham veri (`FirstValue`) ve filtrelenmiş verinin (`FilteredValue`) tek bir veri bloğunda paketlenmesi.
-- **Modern Rastgele Sayı Üretimi (`<random>`):** Mersenne Twister (`mt19937`) motoru, Gauss dip gürültüsü (`normal_distribution`) ve Bernoulli dağılımı ile gerçekçi sensör simülasyonu.
+## Mimari ve Kullanılan C++ Konseptleri
+- **Nesne Yönelimli Tasarım (OOP) & Kapsülleme:** Filtre durumunun, tampon belleğin ve parametrelerin `AdaptiveMovingAverage` sınıfı içinde kapsüllenmesi.
+- **Ring Buffer (Dairesel Tampon) & Kayan Toplam:** Modulo aritmetiği (`head = (head + 1) % windowSize`) ve `runningSum` ile her adımda döngü kurmadan $O(1)$ sürede ortalama hesabı.
+- **Sonlu Durum Makinesi (Finite State Machine - FSM):** `enum State` ve `enum FilterStatus` yapılarıyla nedensel (causal), gerçek zamanlı karar yönetimi.
+- **RAII & Dinamik Bellek Yönetimi:** Constructor (`AdaptiveMovingAverage`) içinde yalnızca pencere boyutu kadar bellek tahsisi (`new[]`) ve Destructor (`~AdaptiveMovingAverage`) içinde güvenli bellek temizliği (`delete[]`).
+
+---
+
+## Gerçek Sensörlerle Entegrasyon Rehberi (Nasıl Kullanılır?)
+
+`AdaptiveMovingAverage` sınıfı herhangi bir veri dizisine bağımlı değildir; sensörden okuduğunuz ham değeri `filter.update(hamVeri)` metoduna göndermeniz yeterlidir.
+
+### 1. Arduino / ESP32 / STM32 (Örn: HC-SR04 Ultrasonik veya VL53L1X ToF Sensörü)
+Mikrodenetleyici projelerinde `AdaptiveMovingAverage` sınıfını kodunuza dahil ettikten sonra `loop()` içinde doğrudan kullanabilirsiniz:
+
+```cpp
+// Pencere Boyutu: 5 örnek, Sıçrama Eşiği (Threshold): 20.0 mm (veya cm)
+AdaptiveMovingAverage distanceFilter(5, 20.0f);
+
+void setup() {
+    Serial.begin(115200);
+    // Sensör başlatma kodları (Örn: sensor.init();)
+}
+
+void loop() {
+    // 1. Sensörden anlık ham mesafeyi oku
+    float rawDistance = readUltrasonicSensor(); // veya sensor.readRangeContinuousMillimeters();
+
+    // 2. Ham veriyi filtreye gönder ve temizlenmiş çıktıyı anında al
+    float cleanDistance = distanceFilter.update(rawDistance);
+
+    // 3. Temiz veriyi motor sürücüye veya PID kontrolcüye gönder
+    pidController.compute(cleanDistance);
+
+    delay(10); // 100 Hz (10 ms) örnekleme periyodu
+}
+```
+
+### 2. Standart C++ / ROS (Robot Operating System) / Linux Gömülü Sistemler
+Sensör verilerinin bir `while` döngüsü veya callback fonksiyonu ile geldiği sistemlerde:
+
+```cpp
+// Nesneyi oluştur (Pencere: 5, Eşik: 20.0 birim)
+AdaptiveMovingAverage lidarFilter(5, 20.0f);
+
+// Sensörden her yeni paket geldiğinde çalışan fonksiyon / döngü:
+void onSensorDataReceived(float rawMeasurement) {
+    float filteredValue = lidarFilter.update(rawMeasurement);
+
+    // İsteğe bağlı: Filtrenin o anki kararını kontrol et
+    if (lidarFilter.getStatus() == STATUS_NEW_LEVEL) {
+        std::cout << "Sensör önünde yeni bir engel/seviye doğrulandı: " << filteredValue << std::endl;
+    }
+}
+```
+
+> **Parametre Ayarı İpucu (`windowSize` ve `threshold`):**
+> - **`windowSize` (Örn: `5` - `10`):** Küçük değerler daha hızlı tepki verir, büyük değerler sinyali daha pürüzsüz yapar.
+> - **`threshold` (Örn: `20.0f`):** Sensörünüzün normal dip gürültüsünün (standart sapmasının) yaklaşık **4-5 katı** olarak seçilmelidir. Örneğin sensörünüz durduğu yerde `±3 cm` oynuyorsa, `threshold` değerini `15.0f` veya `20.0f` yapmak; normal dalgalanmaların ortalamaya girmesini, `20 cm` üzeri ani sıçramaların ise doğrulama mekanizmasına takılmasını sağlar.
 
 ---
 
 ## Örnek Çıktı Analizi (Kritik Kırılma Anları)
 
-Aşağıdaki kesitte algoritmanın **50. ms** ve **370. ms**'deki sahte sıçramaları nasıl yuttuğu, **400. ms** ve **750. ms**'deki gerçek mesafe değişimlerine ise gecikmesiz nasıl adapte olduğu görülmektedir:
+Aşağıdaki gerçek zamanlı simülasyon kesitinde;
+- **20. ve 30. ms**'de üst üste gelen iki ters yönlü spike'ın (`551.32` ve `444.51`) nasıl bekletilip **40. ms**'de tamamen reddedildiği,
+- **400. ms** ve **750. ms**'deki kalıcı seviye değişimlerinin ise sadece 1 örnek (10 ms) doğrulama sonrasında eski ortalama unutularak nasıl yakalandığı görülmektedir:
 
 ```text
-Zaman(ms)       Ham             Filtreli        Durum
--------------------------------------------------------------------------
-0               499.85          499.85
+Zaman(ms)       Ham             Filtreli        Durum (Real-Time Karar)
+----------------------------------------------------------------------------------
+0               498.49          498.49
+10              498.65          498.57
+20              551.32          498.57          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+30              444.51          498.57          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+40              501.99          499.71          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
+50              500.48          499.90
 ...
-40              499.98          501.85
-50              453.71          501.85          <-- SPIKE SILINDI (Eski MA devam ediyor)
-60              497.96          501.11
+240             500.79          500.55
+250             442.68          500.55          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+260             498.45          500.62          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
 ...
-360             501.52          500.28
-370             451.54          500.28          <-- SPIKE SILINDI (Eski MA devam ediyor)
-380             499.38          500.07
-390             498.37          500.80
-400             561.87          561.87          <-- YENI SEVIYE ONAYLANDI (Eski MA unutuldu!)
-410             560.92          561.39
-420             560.14          560.98
-430             485.82          560.98          <-- SPIKE SILINDI (Eski MA devam ediyor)
-440             560.08          560.80
+390             504.53          499.78
+400             556.68          499.78          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+410             562.62          559.65          <-- [YENI SEVIYE] Dogrulandi! Eski MA unutuldu!
+420             560.57          559.95
 ...
-740             565.09          561.35
-750             501.35          501.35          <-- YENI SEVIYE ONAYLANDI (Eski MA unutuldu!)
-760             499.22          500.29
+740             558.24          559.81
+750             616.52          559.81          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+760             621.23          618.87          <-- [YENI SEVIYE] Dogrulandi! Eski MA unutuldu!
+770             658.42          618.87          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+780             623.24          620.33          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
 ```
 
 <details>
 <summary><b>📄 1 Saniyelik Tüm Simülasyon Verisini Görüntüle (0 - 1000 ms)</b></summary>
 
 ```text
-Zaman(ms)       Ham             Filtreli        Durum
--------------------------------------------------------------------------
-0               499.85          499.85
-10              503.66          501.75
-20              503.27          502.26
-30              502.50          502.32
-40              499.98          501.85
-50              453.71          501.85          <-- SPIKE SILINDI
-60              497.96          501.11
-70              499.89          500.44
-80              506.98          501.33
-90              499.76          501.29
-100             497.23          500.36
-110             495.43          499.86
-120             499.10          499.70
-130             498.88          498.08
-140             495.84          497.30
-150             499.35          497.72
-160             498.08          498.25
-170             500.68          498.56
-180             494.87          497.76
-190             498.01          498.20
-200             496.51          497.63
-210             497.65          497.54
-220             502.46          497.90
-230             499.65          498.86
-240             501.61          499.58
-250             499.34          500.14
-260             499.34          500.48
-270             499.40          499.87
-280             500.33          500.00
-290             501.97          500.08
-300             501.40          500.49
-310             500.02          500.63
-320             500.74          500.74
-330             500.74          500.82
-340             494.71          499.37
-350             504.47          499.99
-360             501.52          500.28
-370             451.54          500.28          <-- SPIKE SILINDI
-380             499.38          500.07
-390             498.37          500.80
-400             561.87          561.87          <-- YENI SEVIYE ONAYLANDI
-410             560.92          561.39
-420             560.14          560.98
-430             485.82          560.98          <-- SPIKE SILINDI
-440             560.08          560.80
-450             563.63          561.15
-460             557.64          560.50
-470             559.02          560.27
-480             565.12          561.10
-490             562.20          561.52
-500             560.93          560.98
-510             560.09          561.47
-520             560.47          561.76
-530             561.40          561.02
-540             561.79          560.94
-550             561.91          561.13
-560             558.62          560.84
-570             558.75          560.49
-580             557.08          559.63
-590             557.09          558.69
-600             556.42          557.59
-610             558.62          557.59
-620             556.79          557.20
-630             624.21          557.20          <-- SPIKE SILINDI
-640             562.74          558.35
-650             559.36          558.94
-660             564.80          560.18
-670             509.44          560.18          <-- SPIKE SILINDI
-680             559.09          561.23
-690             561.07          560.90
-700             561.42          561.31
-710             562.13          560.78
-720             557.80          560.30
-730             599.03          560.30          <-- SPIKE SILINDI
-740             565.09          561.35
-750             501.35          501.35          <-- YENI SEVIYE ONAYLANDI
-760             499.22          500.29
-770             502.02          500.86
-780             497.61          500.05
-790             501.46          500.33
-800             498.15          499.69
-810             500.63          499.97
-820             501.29          499.83
-830             501.92          500.69
-840             493.14          499.03
-850             499.19          499.23
-860             503.17          499.74
-870             502.26          499.94
-880             501.11          499.78
-890             429.18          499.78          <-- SPIKE SILINDI
-900             499.23          501.11
-910             501.07          500.69
-920             501.07          500.45
-930             498.80          499.99
-940             492.76          498.59
-950             500.95          498.93
-960             495.58          497.83
-970             496.06          496.83
-980             499.57          496.98
-990             498.10          498.05
-1000            499.08          497.68
+Zaman(ms)       Ham             Filtreli        Durum (Real-Time Karar)
+----------------------------------------------------------------------------------
+0               498.49          498.49
+10              498.65          498.57
+20              551.32          498.57          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+30              444.51          498.57          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+40              501.99          499.71          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
+50              500.48          499.90
+60              495.41          499.00
+70              500.34          499.37
+80              502.99          500.24
+90              501.89          500.22
+100             502.92          500.71
+110             495.78          500.78
+120             500.36          500.79
+130             500.03          500.20
+140             498.27          499.47
+150             496.40          498.17
+160             500.89          499.19
+170             501.13          499.35
+180             504.99          500.34
+190             496.85          500.05
+200             498.12          500.40
+210             501.12          500.44
+220             500.98          500.41
+230             501.75          499.76
+240             500.79          500.55
+250             442.68          500.55          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+260             498.45          500.62          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
+270             503.54          501.10
+280             498.21          500.55
+290             499.33          500.06
+300             498.58          499.62
+310             501.08          500.15
+320             503.63          500.17
+330             504.70          501.47
+340             501.28          501.86
+350             496.03          501.35
+360             500.49          501.23
+370             498.30          500.16
+380             499.57          499.13
+390             504.53          499.78
+400             556.68          499.78          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+410             562.62          559.65          <-- [YENI SEVIYE] Dogrulandi! Eski MA unutuldu!
+420             560.57          559.95
+430             562.04          560.48
+440             561.14          560.61
+450             558.21          560.92
+460             563.82          561.16
+470             559.74          560.99
+480             562.80          561.14
+490             561.34          561.18
+500             561.28          561.80
+510             556.64          560.36
+520             562.18          560.85
+530             562.72          560.83
+540             561.94          560.95
+550             558.58          560.41
+560             563.16          561.72
+570             558.95          561.07
+580             559.65          560.46
+590             632.78          560.46          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+600             560.89          560.25          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
+610             563.21          561.17
+620             559.62          560.46
+630             606.53          560.46          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+640             557.92          560.26          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
+650             564.09          561.15
+660             560.38          561.05
+670             521.15          561.05          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+680             561.62          560.73          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
+690             611.23          560.73          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+700             562.26          561.25          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
+710             559.07          561.48
+720             560.29          560.72
+730             559.19          560.48
+740             558.24          559.81
+750             616.52          559.81          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+760             621.23          618.87          <-- [YENI SEVIYE] Dogrulandi! Eski MA unutuldu!
+770             658.42          618.87          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+780             623.24          620.33          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
+790             619.36          620.09
+800             619.59          619.99
+810             617.59          620.20
+820             621.15          620.18
+830             692.84          620.18          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+840             616.33          618.80          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
+850             681.56          618.80          <-- [BEKLEMEDE] Supheli veri! Dogrulama bekleniyor...
+860             618.30          618.59          <-- [SPIKE SILINDI] Onceki supheli veri reddedildi!
+870             617.38          618.15
+880             619.35          618.50
+890             624.56          619.18
+900             625.09          620.93
+910             618.54          620.98
+920             620.83          621.67
+930             620.40          621.88
+940             619.08          620.79
+950             616.51          619.07
+960             620.33          619.43
+970             618.60          618.98
+980             618.90          618.68
+990             620.38          618.94
+1000            621.50          619.94
 ```
 </details>
 
 ---
 
-## Nasıl Çalıştırılır?
+## Simülasyonu Çalıştırma
 
-Projeyi klonlayın ve `g++` derleyicisi ile derleyip çalıştırın:
+Projeyi klonlayın ve `g++` derleyicisi ile simülasyonu derleyip çalıştırın:
 
 ```bash
 git clone [https://github.com/ardasengur/sensor-noise-filter-cpp.git](https://github.com/ardasengur/sensor-noise-filter-cpp.git)
